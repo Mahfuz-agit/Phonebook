@@ -5,6 +5,10 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+defaults:
+  run:
+    working-directory: phonebook-app
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -36,11 +40,11 @@ jobs:
         run: chmod +x android/gradlew
 
       - name: Build release APK
-        working-directory: android
+        working-directory: phonebook-app/android
         run: ./gradlew assembleRelease
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: phonebook-apk
-          path: android/app/build/outputs/apk/release/app-release.apk
+          path: phonebook-app/android/app/build/outputs/apk/release/app-release.apk
