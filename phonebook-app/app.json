@@ -2,7 +2,7 @@
   "expo": {
     "name": "Phonebook",
     "slug": "phonebook-app",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "backgroundColor": "#FFFFFF",
@@ -11,7 +11,12 @@
     },
     "android": {
       "package": "com.phonebook.minimal",
-      "backgroundColor": "#FFFFFF"
+      "backgroundColor": "#FFFFFF",
+      "permissions": [
+        "READ_CALL_LOG",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE"
+      ]
     }
   }
 }
