@@ -1,24 +1,30 @@
-# Phonebook (Minimal)
+# Phonebook v2
 
-Minimal, elite-style phonebook app. React Native + Expo.
+Minimal, Apple-style phonebook. React Native + Expo. Android native (APK via GitHub Actions).
 
-## Features
-- Add / search / delete contacts
-- Favorites (star, sorted to top)
-- Saved on device (AsyncStorage) — survives app restarts
-- Light theme only, Apple HIG-inspired spacing and type
+## v2 features
+- All v1: add / search / delete / favorites, light theme
+- Tap a contact to call directly
+- **CSV backup**: pick a folder once (like Obsidian vault) — auto-backs up on every add/delete, plus manual "Backup now" button
+- **CSV restore**: pick any CSV file, merge or replace contacts
+- **Call log tab**: shows recent calls, tap unknown numbers to quick-add to phonebook
+- Manual contact add only (no phone contacts import)
 
-## Run locally
+## Permissions used
+- READ_CALL_LOG — show call history tab
+- Storage access (SAF) — pick backup folder, read/write CSV
+
+These are requested at runtime, not silently.
+
+## Setup
 ```
 npm install
-npx expo start
+npx expo prebuild --platform android --non-interactive
 ```
 
 ## Build APK on GitHub
-1. Push this folder to a new GitHub repo.
-2. Go to repo tab: Actions.
-3. Run workflow "Build Android APK" (or push to main — it runs automatically).
-4. When done, download the `phonebook-apk` artifact.
-5. Install the `.apk` on your Android phone (enable "install unknown apps" once).
+Same as v1 — push to repo, run the "Build Android APK" workflow in Actions tab (`.github/workflows/build-apk.yml` must be at repo ROOT, not inside phonebook-app/).
 
-No Mac, no Android Studio, no local build needed.
+## Notes
+- Call log + backup folder picker only work on real Android devices/builds, not on iOS.
+- `react-native-call-log` needs the native prebuild step (already in the workflow) — it won't work in Expo Go.
