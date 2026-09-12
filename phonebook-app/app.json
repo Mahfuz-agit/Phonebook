@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "Phonebook",
+    "slug": "phonebook-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#FFFFFF",
+    "splash": {
+      "backgroundColor": "#FFFFFF"
+    },
+    "android": {
+      "package": "com.phonebook.minimal",
+      "backgroundColor": "#FFFFFF"
+    }
+  }
+}
