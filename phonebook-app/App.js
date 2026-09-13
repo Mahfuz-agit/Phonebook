@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   SafeAreaView,
   View,
@@ -13,32 +13,76 @@ import {
   Platform,
   PermissionsAndroid,
   Linking,
+  Animated,
+  LayoutAnimation,
+  UIManager,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system';
 import * as DocumentPicker from 'expo-document-picker';
 import CallLogs from 'react-native-call-log';
-import { toCSV, fromCSV } from './utils/csv';
+import { fromCSV } from './utils/csv';
+import { writeMainBackup, appendDeletedContact } from './utils/backup';
+import { loadActivityLog, addActivityEntry, formatLogTime } from './utils/activityLog';
+
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
 
 const STORAGE_KEY = 'phonebook_contacts_v1';
 const BACKUP_DIR_KEY = 'phonebook_backup_dir_v1';
-const BACKUP_FILE_NAME = 'phonebook_backup.csv';
 
 const BLUE = '#007AFF';
 const BG = '#FFFFFF';
 const TEXT = '#1C1C1E';
 const SUBTLE = '#8E8E93';
 const DIVIDER = '#E5E5EA';
+const RED = '#FF3B30';
 
 function normalizePhone(p) {
   const digits = String(p || '').replace(/\D/g, '');
   return digits.slice(-10);
 }
 
+function smoothNext() {
+  LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+}
+
+// ---------- Slide-in panel (iOS push feel) ----------
+function SlidePanel({ visible, onClose, children }) {
+  const translateX = useRef(new Animated.Value(400)).current;
+
+  useEffect(() => {
+    Animated.spring(translateX, {
+      toValue: visible ? 0 : 400,
+      useNativeDriver: true,
+      speed: 16,
+      bounciness: 4,
+    }).start();
+  }, [visible]);
+
+  if (!visible && translateX.__getValue && translateX.__getValue() >= 400) {
+    // fully off-screen and hidden -> don't render heavy content
+  }
+
+  return (
+    <Animated.View
+      pointerEvents={visible ? 'auto' : 'none'}
+      style={[
+        styles.slidePanel,
+        { transform: [{ translateX }] },
+      ]}
+    >
+      {children}
+    </Animated.View>
+  );
+}
+
 export default function App() {
   const [contacts, setContacts] = useState([]);
   const [query, setQuery] = useState('');
   const [modalVisible, setModalVisible] = useState(false);
+  const [editingId, setEditingId] = useState(null);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [loaded, setLoaded] = useState(false);
@@ -46,8 +90,12 @@ export default function App() {
   const [backupDirUri, setBackupDirUri] = useState(null);
   const [callLogData, setCallLogData] = useState([]);
   const [callLogLoading, setCallLogLoading] = useState(false);
+  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [activityVisible, setActivityVisible] = useState(false);
+  const [activityLog, setActivityLog] = useState([]);
 
-  // load contacts + backup dir on start
+  const tabFade = useRef(new Animated.Value(1)).current;
+
   useEffect(() => {
     (async () => {
       try {
@@ -63,14 +111,22 @@ export default function App() {
     })();
   }, []);
 
-  // save contacts + auto backup on every change
   useEffect(() => {
     if (!loaded) return;
     AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(contacts)).catch(() => {});
     if (backupDirUri) {
-      writeBackup(backupDirUri, contacts).catch(() => {});
+      writeMainBackup(backupDirUri, contacts).catch(() => {});
     }
   }, [contacts, loaded]);
+
+  function fadeTabSwitch(nextTab) {
+    Animated.sequence([
+      Animated.timing(tabFade, { toValue: 0, duration: 100, useNativeDriver: true }),
+    ]).start(() => {
+      setActiveTab(nextTab);
+      Animated.timing(tabFade, { toValue: 1, duration: 150, useNativeDriver: true }).start();
+    });
+  }
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -90,39 +146,78 @@ export default function App() {
   function resetForm() {
     setName('');
     setPhone('');
+    setEditingId(null);
   }
 
-  function addContact(prefillName, prefillPhone) {
-    const trimmedName = (prefillName ?? name).trim();
-    const trimmedPhone = (prefillPhone ?? phone).trim();
+  function openAddModal(prefillName, prefillPhone) {
+    setEditingId(null);
+    setName(prefillName || '');
+    setPhone(prefillPhone || '');
+    setModalVisible(true);
+  }
+
+  function openEditModal(contact) {
+    setEditingId(contact.id);
+    setName(contact.name);
+    setPhone(contact.phone);
+    setModalVisible(true);
+  }
+
+  async function saveContact() {
+    const trimmedName = name.trim();
+    const trimmedPhone = phone.trim();
     if (!trimmedName || !trimmedPhone) {
       Alert.alert('Missing info', 'Enter name and phone number.');
       return;
     }
-    const newContact = {
-      id: Date.now().toString(),
-      name: trimmedName,
-      phone: trimmedPhone,
-      favorite: false,
-    };
-    setContacts((prev) => [...prev, newContact]);
+    smoothNext();
+    if (editingId) {
+      let before = null;
+      setContacts((prev) =>
+        prev.map((c) => {
+          if (c.id === editingId) {
+            before = c;
+            return { ...c, name: trimmedName, phone: trimmedPhone };
+          }
+          return c;
+        })
+      );
+      addActivityEntry('edit', { name: trimmedName, phone: trimmedPhone }, before ? `was: ${before.name}, ${before.phone}` : null);
+    } else {
+      const newContact = {
+        id: Date.now().toString(),
+        name: trimmedName,
+        phone: trimmedPhone,
+        favorite: false,
+      };
+      setContacts((prev) => [...prev, newContact]);
+      addActivityEntry('add', newContact);
+    }
     resetForm();
     setModalVisible(false);
   }
 
   function toggleFavorite(id) {
+    smoothNext();
     setContacts((prev) =>
       prev.map((c) => (c.id === id ? { ...c, favorite: !c.favorite } : c))
     );
   }
 
-  function deleteContact(id) {
-    Alert.alert('Delete contact', 'Remove this contact?', [
+  function deleteContact(contact) {
+    Alert.alert('Delete contact', `Remove ${contact.name}?`, [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Delete',
         style: 'destructive',
-        onPress: () => setContacts((prev) => prev.filter((c) => c.id !== id)),
+        onPress: async () => {
+          smoothNext();
+          setContacts((prev) => prev.filter((c) => c.id !== contact.id));
+          addActivityEntry('delete', contact);
+          if (backupDirUri) {
+            appendDeletedContact(backupDirUri, contact).catch(() => {});
+          }
+        },
       },
     ]);
   }
@@ -133,29 +228,7 @@ export default function App() {
     });
   }
 
-  // ---------- Backup (CSV, Obsidian-style folder) ----------
-
-  async function writeBackup(dirUri, contactsList) {
-    try {
-      const csv = toCSV(contactsList);
-      const existing = await FileSystem.StorageAccessFramework.readDirectoryAsync(dirUri);
-      const existingFile = existing.find((uri) => uri.includes(BACKUP_FILE_NAME));
-      let fileUri = existingFile;
-      if (!fileUri) {
-        fileUri = await FileSystem.StorageAccessFramework.createFileAsync(
-          dirUri,
-          BACKUP_FILE_NAME,
-          'text/csv'
-        );
-      }
-      await FileSystem.writeAsStringAsync(fileUri, csv, {
-        encoding: FileSystem.EncodingType.UTF8,
-      });
-    } catch (e) {
-      // silent fail for auto-backup; manual backup shows alert
-      throw e;
-    }
-  }
+  // ---------- Backup / restore ----------
 
   async function pickBackupFolder() {
     try {
@@ -163,7 +236,7 @@ export default function App() {
       if (!perm.granted) return;
       setBackupDirUri(perm.directoryUri);
       await AsyncStorage.setItem(BACKUP_DIR_KEY, perm.directoryUri);
-      Alert.alert('Folder set', 'Backups will save here automatically.');
+      Alert.alert('Folder set', 'Backups (and deleted contacts) will save here.');
     } catch (e) {
       Alert.alert('Error', 'Could not set backup folder.');
     }
@@ -175,7 +248,7 @@ export default function App() {
       return;
     }
     try {
-      await writeBackup(backupDirUri, contacts);
+      await writeMainBackup(backupDirUri, contacts);
       Alert.alert('Backup done', 'Contacts saved to CSV.');
     } catch (e) {
       Alert.alert('Backup failed', 'Could not write CSV file.');
@@ -205,12 +278,18 @@ export default function App() {
           { text: 'Cancel', style: 'cancel' },
           {
             text: 'Merge',
-            onPress: () => setContacts((prev) => [...prev, ...imported]),
+            onPress: () => {
+              smoothNext();
+              setContacts((prev) => [...prev, ...imported]);
+            },
           },
           {
             text: 'Replace',
             style: 'destructive',
-            onPress: () => setContacts(imported),
+            onPress: () => {
+              smoothNext();
+              setContacts(imported);
+            },
           },
         ]
       );
@@ -222,10 +301,7 @@ export default function App() {
   // ---------- Call log ----------
 
   const loadCallLog = useCallback(async () => {
-    if (Platform.OS !== 'android') {
-      Alert.alert('Not supported', 'Call log is Android only.');
-      return;
-    }
+    if (Platform.OS !== 'android') return;
     setCallLogLoading(true);
     try {
       const granted = await PermissionsAndroid.request(
@@ -237,14 +313,13 @@ export default function App() {
         }
       );
       if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-        Alert.alert('Permission denied', 'Cannot show call log without permission.');
         setCallLogLoading(false);
         return;
       }
       const logs = await CallLogs.load(100);
       setCallLogData(logs || []);
     } catch (e) {
-      Alert.alert('Error', 'Could not load call log.');
+      // ignore
     } finally {
       setCallLogLoading(false);
     }
@@ -262,24 +337,40 @@ export default function App() {
     return contacts.find((c) => normalizePhone(c.phone) === norm) || null;
   }
 
-  function suggestAddFromCallLog(rawNumber, suggestedName) {
-    setName(suggestedName || '');
-    setPhone(rawNumber);
-    setModalVisible(true);
+  // ---------- Activity log ----------
+
+  async function openActivityLog() {
+    const log = await loadActivityLog();
+    setActivityLog(log);
+    setActivityVisible(true);
   }
 
-  // ---------- Render helpers ----------
+  async function refreshActivityAfterChange() {
+    const log = await loadActivityLog();
+    setActivityLog(log);
+  }
+
+  // keep activity list fresh whenever contacts changes while panel open
+  useEffect(() => {
+    if (activityVisible) refreshActivityAfterChange();
+  }, [contacts]);
+
+  // ---------- Renderers ----------
 
   function renderContactRow({ item }) {
     return (
       <TouchableOpacity
         style={styles.row}
-        onLongPress={() => deleteContact(item.id)}
+        onPress={() => openEditModal(item)}
+        onLongPress={() => deleteContact(item)}
         activeOpacity={0.6}
       >
-        <TouchableOpacity onPress={() => callNumber(item.phone)} style={{ flex: 1 }}>
+        <View style={{ flex: 1 }}>
           <Text style={styles.name}>{item.name}</Text>
           <Text style={styles.phone}>{item.phone}</Text>
+        </View>
+        <TouchableOpacity onPress={() => callNumber(item.phone)} hitSlop={10} style={{ marginRight: 14 }}>
+          <Text style={styles.callIcon}>📞</Text>
         </TouchableOpacity>
         <TouchableOpacity onPress={() => toggleFavorite(item.id)} hitSlop={10}>
           <Text style={[styles.star, item.favorite && styles.starActive]}>
@@ -305,7 +396,7 @@ export default function App() {
         {isUnknown ? (
           <TouchableOpacity
             style={styles.addSmallBtn}
-            onPress={() => suggestAddFromCallLog(item.phoneNumber, item.name)}
+            onPress={() => openAddModal(item.name, item.phoneNumber)}
           >
             <Text style={styles.addSmallBtnText}>Add</Text>
           </TouchableOpacity>
@@ -318,110 +409,120 @@ export default function App() {
     );
   }
 
+  function renderActivityRow({ item }) {
+    const label = item.action === 'add' ? 'Added' : item.action === 'delete' ? 'Deleted' : 'Edited';
+    const color = item.action === 'delete' ? RED : item.action === 'add' ? BLUE : SUBTLE;
+    return (
+      <View style={styles.activityRow}>
+        <View style={[styles.activityDot, { backgroundColor: color }]} />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.name}>
+            {label} · {item.name || 'Unknown'}
+          </Text>
+          <Text style={styles.phone}>{item.phone}</Text>
+          <Text style={styles.activityTime}>{formatLogTime(item.timestamp)}</Text>
+        </View>
+      </View>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="dark-content" backgroundColor={BG} />
-      <Text style={styles.title}>Phonebook</Text>
+
+      <View style={styles.header}>
+        <Text style={styles.title}>Phonebook</Text>
+        <TouchableOpacity
+          onPress={() => setSettingsVisible(true)}
+          hitSlop={12}
+          style={styles.gearBtn}
+        >
+          <Text style={styles.gearIcon}>⚙️</Text>
+        </TouchableOpacity>
+      </View>
 
       <View style={styles.tabBar}>
-        {['contacts', 'calls', 'settings'].map((tab) => (
+        {['contacts', 'calls'].map((tab) => (
           <TouchableOpacity
             key={tab}
             style={[styles.tabBtn, activeTab === tab && styles.tabBtnActive]}
-            onPress={() => setActiveTab(tab)}
+            onPress={() => fadeTabSwitch(tab)}
           >
             <Text style={[styles.tabText, activeTab === tab && styles.tabTextActive]}>
-              {tab === 'contacts' ? 'Contacts' : tab === 'calls' ? 'Calls' : 'Settings'}
+              {tab === 'contacts' ? 'Contacts' : 'Calls'}
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      {activeTab === 'contacts' && (
-        <>
-          <TextInput
-            style={styles.search}
-            placeholder="Search"
-            placeholderTextColor={SUBTLE}
-            value={query}
-            onChangeText={setQuery}
-            clearButtonMode="while-editing"
-            autoCorrect={false}
-          />
+      <Animated.View style={{ flex: 1, opacity: tabFade }}>
+        {activeTab === 'contacts' && (
+          <>
+            <TextInput
+              style={styles.search}
+              placeholder="Search"
+              placeholderTextColor={SUBTLE}
+              value={query}
+              onChangeText={setQuery}
+              clearButtonMode="while-editing"
+              autoCorrect={false}
+            />
+            <FlatList
+              data={filtered}
+              keyExtractor={(item) => item.id}
+              renderItem={renderContactRow}
+              ItemSeparatorComponent={() => <View style={styles.divider} />}
+              ListEmptyComponent={
+                <Text style={styles.empty}>
+                  {contacts.length === 0 ? 'No contacts yet.' : 'No matches.'}
+                </Text>
+              }
+              contentContainerStyle={filtered.length === 0 && { flex: 1 }}
+            />
+          </>
+        )}
+
+        {activeTab === 'calls' && (
           <FlatList
-            data={filtered}
-            keyExtractor={(item) => item.id}
-            renderItem={renderContactRow}
+            data={callLogData}
+            keyExtractor={(item, idx) => String(item.timestamp) + idx}
+            renderItem={renderCallLogRow}
             ItemSeparatorComponent={() => <View style={styles.divider} />}
+            refreshing={callLogLoading}
+            onRefresh={loadCallLog}
             ListEmptyComponent={
               <Text style={styles.empty}>
-                {contacts.length === 0 ? 'No contacts yet.' : 'No matches.'}
+                {callLogLoading ? 'Loading...' : 'No call log data. Pull to refresh.'}
               </Text>
             }
-            contentContainerStyle={filtered.length === 0 && { flex: 1 }}
+            contentContainerStyle={callLogData.length === 0 && { flex: 1 }}
           />
-          <TouchableOpacity
-            style={styles.fab}
-            onPress={() => setModalVisible(true)}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.fabText}>+</Text>
-          </TouchableOpacity>
-        </>
+        )}
+      </Animated.View>
+
+      {activeTab === 'contacts' && (
+        <TouchableOpacity
+          style={styles.fab}
+          onPress={() => openAddModal()}
+          activeOpacity={0.8}
+        >
+          <Text style={styles.fabText}>+</Text>
+        </TouchableOpacity>
       )}
 
-      {activeTab === 'calls' && (
-        <FlatList
-          data={callLogData}
-          keyExtractor={(item, idx) => String(item.timestamp) + idx}
-          renderItem={renderCallLogRow}
-          ItemSeparatorComponent={() => <View style={styles.divider} />}
-          refreshing={callLogLoading}
-          onRefresh={loadCallLog}
-          ListEmptyComponent={
-            <Text style={styles.empty}>
-              {callLogLoading ? 'Loading...' : 'No call log data. Pull to refresh.'}
-            </Text>
-          }
-          contentContainerStyle={callLogData.length === 0 && { flex: 1 }}
-        />
-      )}
-
-      {activeTab === 'settings' && (
-        <View style={styles.settingsWrap}>
-          <Text style={styles.settingsLabel}>Backup folder</Text>
-          <Text style={styles.settingsValue}>
-            {backupDirUri ? 'Folder set ✓' : 'Not set'}
-          </Text>
-          <TouchableOpacity style={styles.settingsBtn} onPress={pickBackupFolder}>
-            <Text style={styles.settingsBtnText}>
-              {backupDirUri ? 'Change backup folder' : 'Choose backup folder'}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={styles.settingsBtn} onPress={backupNow}>
-            <Text style={styles.settingsBtnText}>Backup now (CSV)</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity style={styles.settingsBtn} onPress={restoreFromCSV}>
-            <Text style={styles.settingsBtnText}>Restore from CSV</Text>
-          </TouchableOpacity>
-
-          <Text style={styles.settingsNote}>
-            Auto-backup runs after every add or delete, once a folder is set.
-          </Text>
-        </View>
-      )}
-
+      {/* Add / Edit contact modal */}
       <Modal
         visible={modalVisible}
         animationType="slide"
         transparent
-        onRequestClose={() => setModalVisible(false)}
+        onRequestClose={() => {
+          resetForm();
+          setModalVisible(false);
+        }}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
-            <Text style={styles.modalTitle}>New Contact</Text>
+            <Text style={styles.modalTitle}>{editingId ? 'Edit Contact' : 'New Contact'}</Text>
             <TextInput
               style={styles.input}
               placeholder="Name"
@@ -448,13 +549,76 @@ export default function App() {
               >
                 <Text style={styles.cancelText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={() => addContact()} style={styles.saveBtn}>
+              <TouchableOpacity onPress={saveContact} style={styles.saveBtn}>
                 <Text style={styles.saveText}>Save</Text>
               </TouchableOpacity>
             </View>
           </View>
         </View>
       </Modal>
+
+      {/* Settings slide panel (iOS push feel, top-right gear) */}
+      <SlidePanel visible={settingsVisible} onClose={() => setSettingsVisible(false)}>
+        <SafeAreaView style={{ flex: 1, backgroundColor: BG }}>
+          <View style={styles.panelHeader}>
+            <TouchableOpacity onPress={() => setSettingsVisible(false)} hitSlop={12}>
+              <Text style={styles.panelBack}>‹ Back</Text>
+            </TouchableOpacity>
+            <Text style={styles.panelTitle}>Settings</Text>
+            <View style={{ width: 50 }} />
+          </View>
+
+          <View style={styles.settingsWrap}>
+            <Text style={styles.settingsLabel}>Backup folder</Text>
+            <Text style={styles.settingsValue}>
+              {backupDirUri ? 'Folder set ✓' : 'Not set'}
+            </Text>
+            <TouchableOpacity style={styles.settingsBtn} onPress={pickBackupFolder}>
+              <Text style={styles.settingsBtnText}>
+                {backupDirUri ? 'Change backup folder' : 'Choose backup folder'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.settingsBtn} onPress={backupNow}>
+              <Text style={styles.settingsBtnText}>Backup now (CSV)</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.settingsBtn} onPress={restoreFromCSV}>
+              <Text style={styles.settingsBtnText}>Restore from CSV</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.settingsBtn} onPress={openActivityLog}>
+              <Text style={styles.settingsBtnText}>Activity log</Text>
+            </TouchableOpacity>
+
+            <Text style={styles.settingsNote}>
+              Auto-backup runs after every add, edit, or delete, once a folder is set.
+              Deleted contacts are saved separately in a "deleted" subfolder.
+            </Text>
+          </View>
+        </SafeAreaView>
+      </SlidePanel>
+
+      {/* Activity log slide panel */}
+      <SlidePanel visible={activityVisible} onClose={() => setActivityVisible(false)}>
+        <SafeAreaView style={{ flex: 1, backgroundColor: BG }}>
+          <View style={styles.panelHeader}>
+            <TouchableOpacity onPress={() => setActivityVisible(false)} hitSlop={12}>
+              <Text style={styles.panelBack}>‹ Settings</Text>
+            </TouchableOpacity>
+            <Text style={styles.panelTitle}>Activity Log</Text>
+            <View style={{ width: 70 }} />
+          </View>
+          <FlatList
+            data={activityLog}
+            keyExtractor={(item) => item.id}
+            renderItem={renderActivityRow}
+            ItemSeparatorComponent={() => <View style={styles.divider} />}
+            ListEmptyComponent={<Text style={styles.empty}>No activity yet.</Text>}
+            contentContainerStyle={[{ paddingHorizontal: 20 }, activityLog.length === 0 && { flex: 1 }]}
+          />
+        </SafeAreaView>
+      </SlidePanel>
     </SafeAreaView>
   );
 }
@@ -466,12 +630,23 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingTop: Platform.OS === 'android' ? 24 : 8,
   },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
   title: {
     fontSize: 34,
     fontWeight: '700',
     color: TEXT,
-    marginBottom: 12,
     letterSpacing: 0.2,
+  },
+  gearBtn: {
+    padding: 4,
+  },
+  gearIcon: {
+    fontSize: 24,
   },
   tabBar: {
     flexDirection: 'row',
@@ -534,14 +709,12 @@ const styles = StyleSheet.create({
   star: {
     fontSize: 22,
     color: DIVIDER,
-    marginLeft: 12,
   },
   starActive: {
     color: '#FFB000',
   },
   callIcon: {
     fontSize: 20,
-    marginLeft: 12,
   },
   addSmallBtn: {
     backgroundColor: BLUE,
@@ -587,8 +760,35 @@ const styles = StyleSheet.create({
     fontWeight: '400',
     marginTop: -2,
   },
+  slidePanel: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: BG,
+  },
+  panelHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: DIVIDER,
+  },
+  panelBack: {
+    color: BLUE,
+    fontSize: 16,
+  },
+  panelTitle: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: TEXT,
+  },
   settingsWrap: {
-    paddingTop: 8,
+    paddingHorizontal: 20,
+    paddingTop: 16,
   },
   settingsLabel: {
     fontSize: 13,
@@ -618,6 +818,23 @@ const styles = StyleSheet.create({
     color: SUBTLE,
     marginTop: 8,
     lineHeight: 18,
+  },
+  activityRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    paddingVertical: 12,
+  },
+  activityDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginTop: 6,
+    marginRight: 10,
+  },
+  activityTime: {
+    fontSize: 12,
+    color: SUBTLE,
+    marginTop: 2,
   },
   modalOverlay: {
     flex: 1,
